@@ -8,6 +8,17 @@ import pyfiglet
 import time
 import signal
 
+# --------------------------
+# Config / "easy edit" VARs
+# --------------------------
+# If empty list -> use system resolver (no override)
+NAMESERVERS = ["8.8.8.8"]      # e.g. ["8.8.8.8", "1.1.1.1"] or [] to use system DNS
+DNS_TIMEOUT = 3                # socket timeout (seconds)
+DNS_LIFETIME = 5               # total lifetime for a query (seconds)
+RATE_LIMIT_SLEEP = 0.2         # sleep between successful findings (or every iteration)
+DEBUG = False                  # True -> print raw dns responses for debugging
+# --------------------------
+
 # Initialize colorama
 init(autoreset=True)
 
@@ -32,27 +43,66 @@ def banner():
     print()
 
 def resolve_subdomain(subdomain, domain):
-    """Attempts to resolve a subdomain."""
+    """Attempts to resolve a subdomain using a Resolver configured from globals."""
     # Properly format domain
     full_domain = f"{subdomain}.{domain}" if subdomain else domain
 
+    # Create resolver instance so we can control nameservers/timeouts per query
+    resolver = dns.resolver.Resolver(configure=not bool(NAMESERVERS))
+    # If NAMESERVERS is non-empty override the system resolver
+    if NAMESERVERS:
+        resolver.nameservers = list(NAMESERVERS)
+    resolver.timeout = DNS_TIMEOUT
+    resolver.lifetime = DNS_LIFETIME
+
     try:
         # Use dns.resolver to resolve the subdomain
-        answers = dns.resolver.resolve(full_domain, "A")
+        answers = resolver.resolve(full_domain, "A", lifetime=DNS_LIFETIME)
+        if DEBUG:
+            print(YELLOW + f"[DEBUG] Raw answer for {full_domain}: {answers.response.to_text() if getattr(answers, 'response', None) else str(list(answers))}")
+
         for rdata in answers:
-            ip = rdata.address
-            # Check if IP belongs to Cloudflare
-            if not is_cloudflare_ip(ip):
-                print(GREEN + f"[FOUND] {full_domain} -> {ip}")
-                return full_domain, ip
+            # rdata could be an A record with .address attr
+            ip = getattr(rdata, "address", None)
+            if ip is None:
+                # fallback if different record object
+                try:
+                    ip = str(rdata)
+                except Exception:
+                    ip = None
+
+            if ip:
+                # Check if IP belongs to Cloudflare
+                if not is_cloudflare_ip(ip):
+                    print(GREEN + f"[FOUND] {full_domain} -> {ip}")
+                    return full_domain, ip
+                else:
+                    if DEBUG:
+                        print(YELLOW + f"[DEBUG] {full_domain} -> {ip} (cloudflare)")
+                    # continue checking other answers
+        # if we reached here - all answers were Cloudflare or no usable IP
+        if DEBUG:
+            print(YELLOW + f"[DEBUG] No non-Cloudflare A-records for {full_domain}")
     except dns.resolver.NXDOMAIN:
-        print(RED + f"[NOT FOUND] {full_domain}")
+        if DEBUG:
+            print(RED + f"[NXDOMAIN] {full_domain}")
+        else:
+            print(RED + f"[NOT FOUND] {full_domain}")
     except dns.resolver.NoAnswer:
-        print(YELLOW + f"[NO ANSWER] {full_domain}")
+        if DEBUG:
+            print(YELLOW + f"[NO ANSWER] {full_domain} - raw no-answer")
+        else:
+            print(YELLOW + f"[NO ANSWER] {full_domain}")
     except dns.resolver.NoNameservers:
-        print(YELLOW + f"[NO NAMESERVERS] {full_domain}")
+        if DEBUG:
+            print(YELLOW + f"[NO NAMESERVERS] {full_domain} - resolver.nameservers={resolver.nameservers}")
+        else:
+            print(YELLOW + f"[NO NAMESERVERS] {full_domain}")
     except dns.resolver.Timeout:
-        print(YELLOW + f"[TIMEOUT] {full_domain}")
+        if DEBUG:
+            print(YELLOW + f"[TIMEOUT] {full_domain} - timeout after {DNS_LIFETIME}s (nameservers={resolver.nameservers})")
+        else:
+            print(YELLOW + f"[TIMEOUT] {full_domain}")
     except Exception as e:
         print(YELLOW + f"[ERROR] {full_domain}: {str(e)}")
     return None
@@ -60,7 +110,7 @@ def resolve_subdomain(subdomain, domain):
 def is_cloudflare_ip(ip):
     """Check if the IP belongs to Cloudflare's known IP ranges."""
     cloudflare_ip_ranges = [
-        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", 
+        "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
         "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
         "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
         "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
@@ -112,7 +162,16 @@ def main():
     parser.add_argument("-w", "--wordlist", default="dom.txt", help="Path to the wordlist file")
     parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads for concurrent scanning")
     parser.add_argument("-o", "--output", help="Save the results to a file (optional)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug printing of raw DNS responses")
+    parser.add_argument("--nameservers", nargs="+", help="Override nameservers for this run (e.g. --nameservers 8.8.8.8 1.1.1.1)")
     args = parser.parse_args()
+
+    # Allow CLI override of config globals
+    global DEBUG, NAMESERVERS
+    if args.debug:
+        DEBUG = True
+    if args.nameservers:
+        NAMESERVERS = args.nameservers
 
     # Display banner
     banner()
@@ -134,7 +193,7 @@ def main():
             if result:
                 subdomain, ip = result
                 found_results[subdomain] = ip
-                time.sleep(0.1)  # Add rate limiting
+                time.sleep(RATE_LIMIT_SLEEP)
 
     # Save results if output file is specified
     if args.output:
