@@ -7,16 +7,23 @@ from colorama import Fore, Style, init
 import pyfiglet
 import time
 import signal
+import socket
+import csv
 
 # --------------------------
 # Config / "easy edit" VARs
 # --------------------------
 # If empty list -> use system resolver (no override)
 NAMESERVERS = ["8.8.8.8"]      # e.g. ["8.8.8.8", "1.1.1.1"] or [] to use system DNS
-DNS_TIMEOUT = 3                # socket timeout (seconds)
+DNS_TIMEOUT = 5                # socket timeout (seconds)
 DNS_LIFETIME = 5               # total lifetime for a query (seconds)
-RATE_LIMIT_SLEEP = 0.2         # sleep between successful findings (or every iteration)
-DEBUG = False                  # True -> print raw dns responses for debugging
+RATE_LIMIT_SLEEP = 0.4         # sleep between successful findings (or every iteration)
+MAX_THREADS = 50               # Maximum concurrent threads for DNS resolution
+VERBOSE = 0                    # 0 = only FOUND, 1 = FOUND + errors, 2 = all including NO ANSWER, etc.
+# Common TCP and UDP ports to scan
+COMMON_TCP_PORTS = [80, 443, 21, 22, 25, 3306, 5432, 8080, 8443, 3389, 1433]
+COMMON_UDP_PORTS = [53, 123, 161, 162, 5353]
+PORT_SCAN_TIMEOUT = 0.5          # timeout for port scanning (seconds)
 # --------------------------
 
 # Initialize colorama
@@ -58,8 +65,6 @@ def resolve_subdomain(subdomain, domain):
     try:
         # Use dns.resolver to resolve the subdomain
         answers = resolver.resolve(full_domain, "A", lifetime=DNS_LIFETIME)
-        if DEBUG:
-            print(YELLOW + f"[DEBUG] Raw answer for {full_domain}: {answers.response.to_text() if getattr(answers, 'response', None) else str(list(answers))}")
 
         for rdata in answers:
             # rdata could be an A record with .address attr
@@ -73,38 +78,24 @@ def resolve_subdomain(subdomain, domain):
 
             if ip:
                 # Check if IP belongs to Cloudflare
-                if not is_cloudflare_ip(ip):
-                    print(GREEN + f"[FOUND] {full_domain} -> {ip}")
-                    return full_domain, ip
+                is_cf = is_cloudflare_ip(ip)
+                if is_cf:
+                    print(YELLOW + f"[FOUND] {full_domain} -> {ip} (Cloudflare)")
+                    return full_domain, ip, True  # True indicates Cloudflare
                 else:
-                    if DEBUG:
-                        print(YELLOW + f"[DEBUG] {full_domain} -> {ip} (cloudflare)")
-                    # continue checking other answers
-        # if we reached here - all answers were Cloudflare or no usable IP
-        if DEBUG:
-            print(YELLOW + f"[DEBUG] No non-Cloudflare A-records for {full_domain}")
+                    print(GREEN + f"[FOUND] {full_domain} -> {ip}")
+                    return full_domain, ip, False  # False indicates non-Cloudflare
+
     except dns.resolver.NXDOMAIN:
-        if DEBUG:
-            print(RED + f"[NXDOMAIN] {full_domain}")
-        else:
-            print(RED + f"[NOT FOUND] {full_domain}")
+        pass  # Domain not found - silently skip
     except dns.resolver.NoAnswer:
-        if DEBUG:
-            print(YELLOW + f"[NO ANSWER] {full_domain} - raw no-answer")
-        else:
-            print(YELLOW + f"[NO ANSWER] {full_domain}")
+        pass  # No answer - silently skip
     except dns.resolver.NoNameservers:
-        if DEBUG:
-            print(YELLOW + f"[NO NAMESERVERS] {full_domain} - resolver.nameservers={resolver.nameservers}")
-        else:
-            print(YELLOW + f"[NO NAMESERVERS] {full_domain}")
+        pass  # No nameservers - silently skip
     except dns.resolver.Timeout:
-        if DEBUG:
-            print(YELLOW + f"[TIMEOUT] {full_domain} - timeout after {DNS_LIFETIME}s (nameservers={resolver.nameservers})")
-        else:
-            print(YELLOW + f"[TIMEOUT] {full_domain}")
+        pass  # Timeout - silently skip
     except Exception as e:
-        print(YELLOW + f"[ERROR] {full_domain}: {str(e)}")
+        pass  # Other errors - silently skip
     return None
 
 def is_cloudflare_ip(ip):
@@ -121,23 +112,105 @@ def is_cloudflare_ip(ip):
     return any(ip_addr in ip_network(cidr) for cidr in cloudflare_ip_ranges)
 
 def load_wordlist(wordlist_path):
-    """Loads the wordlist from a file."""
+    """Loads the wordlist from a file, ignoring lines that start with #."""
     if os.path.exists(wordlist_path):
         with open(wordlist_path, "r") as file:
-            return [line.strip() for line in file if line.strip()]
+            return [line.strip() for line in file if line.strip() and not line.strip().startswith("#")]
     else:
         print(RED + f"[ERROR] Wordlist file not found: {wordlist_path}")
         sys.exit(1)
 
 def save_results_to_file(results, output_file):
-    """Saves the results to a specified file."""
+    """Saves the results to a CSV file with geo-location info."""
     try:
-        with open(output_file, "w") as file:
-            for subdomain, ip in results.items():
-                file.write(f"{subdomain} -> {ip}\n")
+        with open(output_file, "w", newline="") as csvfile:
+            fieldnames = ["Subdomain", "IP Address", "Country", "Cloudflare", "Open Ports"]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            for subdomain, data in results.items():
+                ip = data["ip"]
+                is_cf = data["is_cloudflare"]
+                country = data.get("country", "Unknown")
+                open_ports = data.get("open_ports", "")
+                cf_note = "Yes" if is_cf else "No"
+                writer.writerow({
+                    "Subdomain": subdomain,
+                    "IP Address": ip,
+                    "Country": country,
+                    "Cloudflare": cf_note,
+                    "Open Ports": open_ports
+                })
         print(GREEN + f"[INFO] Results saved to {output_file}")
     except Exception as e:
         print(RED + f"[ERROR] Failed to save results: {str(e)}")
+
+def get_geo_location(ip):
+    """Get geo-location (country) for an IP address."""
+    try:
+        import urllib.request
+        import json
+        
+        # Try ipapi.co first
+        try:
+            response = urllib.request.urlopen(f"https://ipapi.co/{ip}/json/", timeout=3)
+            data = json.loads(response.read().decode())
+            country = data.get("country_name", None)
+            if country:
+                return country
+        except Exception:
+            pass
+        
+        # Fallback to ip-api.com
+        try:
+            response = urllib.request.urlopen(f"http://ip-api.com/json/{ip}", timeout=3)
+            data = json.loads(response.read().decode())
+            country = data.get("country", None)
+            if country:
+                return country
+        except Exception:
+            pass
+        
+        # If both fail, return Unknown
+        return "Unknown"
+    except Exception:
+        return "Unknown"
+
+def check_port(ip, port, protocol="tcp"):
+    """Check if a specific port is open on an IP."""
+    try:
+        if protocol.lower() == "tcp":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(PORT_SCAN_TIMEOUT)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return result == 0
+        elif protocol.lower() == "udp":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(PORT_SCAN_TIMEOUT)
+            sock.sendto(b"", (ip, port))
+            try:
+                sock.recvfrom(1024)
+                sock.close()
+                return True
+            except socket.timeout:
+                sock.close()
+                return False
+    except Exception:
+        return False
+    return False
+
+def scan_ports(ip):
+    """Scan common ports on an IP and return list of open ports."""
+    open_ports = []
+    # Scan TCP ports
+    for port in COMMON_TCP_PORTS:
+        if check_port(ip, port, "tcp"):
+            open_ports.append(f"{port}/tcp")
+    # Scan UDP ports
+    for port in COMMON_UDP_PORTS:
+        if check_port(ip, port, "udp"):
+            open_ports.append(f"{port}/udp")
+    return open_ports
 
 def signal_handler(sig, frame):
     """Handles SIGINT (Ctrl+C) to prompt whether to quit."""
@@ -160,16 +233,14 @@ def main():
     parser = argparse.ArgumentParser(description="CloudRip - CloudFlare Bypasser")
     parser.add_argument("domain", help="The domain to resolve (e.g., example.com)")
     parser.add_argument("-w", "--wordlist", default="dom.txt", help="Path to the wordlist file")
-    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads for concurrent scanning")
-    parser.add_argument("-o", "--output", help="Save the results to a file (optional)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug printing of raw DNS responses")
+    parser.add_argument("-v", "--verbose", type=int, default=1, choices=[0, 1, 2], help="Verbosity level: 0=only FOUND, 1=FOUND+errors, 2=all messages")
+    parser.add_argument("-o", "--output", help="Save the results to a file (optional, defaults to domain.csv)")
     parser.add_argument("--nameservers", nargs="+", help="Override nameservers for this run (e.g. --nameservers 8.8.8.8 1.1.1.1)")
     args = parser.parse_args()
 
     # Allow CLI override of config globals
-    global DEBUG, NAMESERVERS
-    if args.debug:
-        DEBUG = True
+    global VERBOSE, NAMESERVERS
+    VERBOSE = args.verbose
     if args.nameservers:
         NAMESERVERS = args.nameservers
 
@@ -183,7 +254,7 @@ def main():
     # Start resolving subdomains concurrently
     print(YELLOW + "[INFO] Starting subdomain resolution...")
     found_results = {}
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
         futures = {executor.submit(resolve_subdomain, subdomain, args.domain): subdomain for subdomain in subdomains}
         for future in as_completed(futures):
             if stop_requested:
@@ -191,15 +262,80 @@ def main():
                 break
             result = future.result()
             if result:
-                subdomain, ip = result
-                found_results[subdomain] = ip
+                subdomain, ip, is_cf = result
+                found_results[subdomain] = {
+                    "ip": ip,
+                    "is_cloudflare": is_cf,
+                    "country": None,
+                    "open_ports": ""
+                }
                 time.sleep(RATE_LIMIT_SLEEP)
 
-    # Save results if output file is specified
+    if not found_results:
+        print(YELLOW + "[INFO] No subdomains found.")
+        return
+
+    # Ask user if they want to scan ports
+    print(WHITE + "\n" + "="*60)
+    scan_ports_choice = input(BLUE + "[?] Do you want to scan for open ports on found IPs? (y/n): ").strip().lower()
+    
+    if scan_ports_choice == 'y':
+        print(YELLOW + "[INFO] Starting port scan...")
+        for subdomain, data in found_results.items():
+            ip = data["ip"]
+            print(YELLOW + f"[INFO] Scanning ports for {ip}...")
+            open_ports = scan_ports(ip)
+            if open_ports:
+                data["open_ports"] = ", ".join(open_ports)
+                print(GREEN + f"[INFO] Open ports on {ip}: {data['open_ports']}")
+            else:
+                print(YELLOW + f"[INFO] No open common ports on {ip}")
+
+    # Get geo-location for all IPs
+    print(YELLOW + "[INFO] Fetching geo-location data...")
+    for subdomain, data in found_results.items():
+        ip = data["ip"]
+        print(YELLOW + f"[INFO] Fetching location for {ip}...", end=" ")
+        country = get_geo_location(ip)
+        data["country"] = country
+        print(GREEN + f"{country}")
+
+    # Determine output file name
     if args.output:
-        save_results_to_file(found_results, args.output)
+        output_file = args.output
+    else:
+        output_file = f"{args.domain}.csv"
+
+    # Check if file exists and ask for confirmation
+    if os.path.exists(output_file):
+        overwrite_choice = input(BLUE + f"[?] File '{output_file}' already exists. Overwrite? (y/n): ").strip().lower()
+        if overwrite_choice != 'y':
+            print(YELLOW + "[INFO] Skipping file save.")
+            print_results(found_results)
+            return
+
+    # Save results to CSV file
+    save_results_to_file(found_results, output_file)
+    
+    # Print results nicely
+    print_results(found_results)
 
     print(WHITE + "The operation has completed successfully.")
+
+def print_results(results):
+    """Print results in a nice formatted table."""
+    print(WHITE + "\n" + "="*120)
+    print(WHITE + "RESULTS SUMMARY")
+    print(WHITE + "="*120)
+    print(f"{BLUE}{'Subdomain':<50} {'IP Address':<20} {'Country':<20} {'CF':<5} {'Open Ports':<25}")
+    print(WHITE + "-"*120)
+    for subdomain, data in results.items():
+        ip = data["ip"]
+        country = data.get("country", "Unknown")
+        is_cf = "Yes" if data["is_cloudflare"] else "No"
+        ports = data.get("open_ports", "None")
+        print(f"{YELLOW}{subdomain:<50} {GREEN}{ip:<20} {BLUE}{country:<20} {YELLOW}{is_cf:<5} {ports:<25}")
+    print(WHITE + "="*120 + "\n")
 
 if __name__ == "__main__":
     main()
